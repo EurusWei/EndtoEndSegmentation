@@ -12,6 +12,7 @@ import py4DSTEM
 from os import path
 import math
 from scipy import optimize
+from scipy import linalg
 import matplotlib.pyplot as plt
 import warnings
 from matplotlib.figure import Figure
@@ -23,6 +24,7 @@ from math import log
 from copy import copy
 import time
 import seaborn as sns
+from sklearn.decomposition import PCA
 
 #ref: https://levelup.gitconnected.com/a-simple-method-to-calculate-circular-intensity-averages-in-images-4186a685af3
 def radial_curve(dp, center):
@@ -66,7 +68,24 @@ def show_radial(datacube, Rx, Ry, center):
     ax.plot(rad, intensity, linewidth=2)
     ax.set_xlim(1,50)
     ax.set_ylim(0,20)
-    
+
+def projection(braggpeaks_intensity, K_max, datacube_symmetrize, particle_labels):
+    '''
+    Note that during projection, excluding the real space info (first two columns).
+    '''
+    x = braggpeaks_intensity[particle_labels == 1]
+    pca = PCA(n_components = K_max)
+    X_project = pca.fit_transform(x)
+    #transform the 2D reciprocal space features to 3D reciprocal space features
+    transformed_features = np.zeros((datacube_symmetrize.data.shape[0], datacube_symmetrize.data.shape[1],
+                                     X_project.shape[-1]))
+    transformed_features[particle_labels == 1] = X_project
+    beta = find_beta(datacube_symmetrize, transformed_features, particle_labels)
+    #obtain 2D coordinate matrix of scan positions and concatenate to reciprocal space feature matrix
+    real_pos = np.array(np.where(particle_labels == 1)).T
+    X_project = np.hstack((real_pos, beta * X_project))
+    return X_project, beta, pca
+
 def average_datacube(datacube, n):
     """
         Smoothing operation to improve the quality of DPs;
@@ -158,14 +177,12 @@ def symmetrize_datacube(datacube_average, probe_kernel_FT, origin_x, origin_y):
     probe_kernel_FT : TYPE
         DESCRIPTION.
     origin_x : i_0.
-    origin_y : Tj_0.
+    origin_y : j_0.
 
     Returns
     -------
-    datacube_symmetrize : 
-        DESCRIPTION.
-    datacube_info_s : 
-
+    datacube_symmetrize : a datacube object
+    datacube_info_s : a numpy array object (for visualization)
     """
     datacube_symmetrize = datacube_average
     #calculate the area that could be symmetrized
@@ -221,9 +238,7 @@ def IsParticle(data, thres = 10000):
     datapar = datasum.copy()
     datapar[datasum <= thres] = 1
     datapar[datasum > thres] = 0
-#     plt.imshow(datapar);plt.colorbar()
     return datapar
-
 
 def generate_particle_index(datacube, particle_labels):
     '''
@@ -449,44 +464,40 @@ def get_bragg_vector_map_raw(braggpeaks, Q_Nx, Q_Ny):
     
     return bvm
 
-class ObtainIntensityMatrix(object):
-    def __init__(self, datacube, braggpeaks, probe_kernel_FT, Qx, Qy, max_dist=None):
-        self.braggpeaks = braggpeaks
-        self.R_Nx = braggpeaks.shape[0]  #: shape of real space (x)
-        self.R_Ny = braggpeaks.shape[1]  #: shape of real space (y)
-        self.Qx = Qx  #: x-coordinates of the voronoi points
-        self.Qy = Qy  #: y-coordinates of the voronoi points 
+def ObtainIntensityMatrix(datacube, braggpeaks, probe_kernel_FT, Qx, Qy, max_dist=None):
+    """
+    Create intensity matrix I for the nanoparticle. Return a 3_D matrix, and the last dimension
+    records the feature vector for each scan position.
+    """
+    R_Nx = braggpeaks.shape[0]  #: shape of real space (x)
+    R_Ny = braggpeaks.shape[1]  #: shape of real space (y)
+    #: the sets of Bragg peaks present at each scan position
+    braggpeak_labels = get_braggpeak_labels_by_scan_position(braggpeaks,
+                    R_Nx, R_Ny, Qx, Qy, max_dist)
 
-        #: the sets of Bragg peaks present at each scan position
-        self.braggpeak_labels = get_braggpeak_labels_by_scan_position(braggpeaks, Qx, Qy, max_dist)
-
-        # Construct X matrix
-        #: first dimension of the data matrix; the number of bragg peaks
-        self.N_feat = len(self.Qx)
-        #: second dimension of the data matrix; the number of scan positions
-        self.N_meas = self.R_Nx*self.R_Ny
-        #: the data matrix
-        self.X = np.zeros((self.N_feat,self.N_meas))  
-        for Rx in range(self.R_Nx):
-            for Ry in range(self.R_Ny):
-                R = Rx*self.R_Ny + Ry
-                s = self.braggpeak_labels[Rx][Ry]
-                pointlist = self.braggpeaks.get_pointlist(Rx,Ry)
-                for i in s:
-                    ind = np.argmin(np.hypot(pointlist.data['qx']-Qx[i],
-                                             pointlist.data['qy']-Qy[i]))
-                    self.X[i,R] = pointlist.data['intensity'][ind]
-                cc_intensity = py4DSTEM.process.utils.get_cross_correlation_fk(datacube.data[Rx,Ry],probe_kernel_FT,corrPower=1, returnval='cc')
-                not_s = [i for i in range(self.N_feat) if i not in s]
-                for i in not_s:
-                    self.X[i,R] = max(cc_intensity[round(Qx[i]),round(Qy[i])], 0)
-        return
+    # Construct X matrix
+    N_feat = len(Qx) #the number of bragg peaks
+    X = np.zeros((R_Nx, R_Ny, N_feat))
+    for Rx in range(R_Nx):
+        for Ry in range(R_Ny):
+            s = braggpeak_labels[Rx][Ry]
+            #pointlist = braggpeaks.raw[Rx, Ry]
+            pointlist = braggpeaks.get_pointlist(Rx, Ry)
+            for i in s:
+                ind = np.argmin(np.hypot(pointlist.data['qx']-Qx[i],
+                                         pointlist.data['qy']-Qy[i]))
+                X[Rx, Ry, i] = pointlist.data['intensity'][ind]
+            cc_intensity = py4DSTEM.process.utils.get_cross_correlation_fk(datacube.data[Rx,Ry],probe_kernel_FT,corrPower=1,returnval='cc')
+            not_s = [i for i in range(N_feat) if i not in s]
+            for i in not_s:
+                X[Rx, Ry, i] = max(cc_intensity[round(Qx[i]),round(Qy[i])], 0)
+    return X
        
-def get_braggpeak_labels_by_scan_position(braggpeaks, Qx, Qy, max_dist=None):
+def get_braggpeak_labels_by_scan_position(braggpeaks, R_Nx, R_Ny, Qx, Qy, max_dist=None):
     assert np.all([name in braggpeaks.dtype.names for name in ('qx','qy')]), "braggpeaks must contain coords 'qx' and 'qy'"
     braggpeak_labels = [[set() for i in range(braggpeaks.shape[1])] for j in range(braggpeaks.shape[0])]
-    for Rx in range(braggpeaks.shape[0]):
-        for Ry in range(braggpeaks.shape[1]):
+    for Rx in range(R_Nx):
+        for Ry in range(R_Ny):
             s = braggpeak_labels[Rx][Ry]
             pointlist = braggpeaks.get_pointlist(Rx,Ry)
             for i in range(pointlist.data.shape[0]):
@@ -498,63 +509,6 @@ def get_braggpeak_labels_by_scan_position(braggpeaks, Qx, Qy, max_dist=None):
                     s.add(label)
 
     return braggpeak_labels
-
-def convert_to_prob(arr, thres=5):
-    m = arr.max()
-    if m < 1e-6:
-        return arr*0
-    arr_copy = arr.copy()
-    if thres:
-        for i in range(len(arr)):
-            if arr[i] > 0:
-                arr_copy[i] = min(1, arr[i]/min(thres, m,))
-    else:
-        for i in range(len(arr)):
-            if arr[i] > 0:
-                arr_copy[i] = arr[i]/m
-    return arr_copy
-
-def create_intensity(braggpeaks_raw, datacube_symmetrize, gx, gy, probe_kernel_FT):
-    bvm_raw = get_bragg_vector_map_raw(braggpeaks_raw,datacube_symmetrize.Q_Nx,datacube_symmetrize.Q_Ny)
-    #py4DSTEM.visualize.show(bvm_raw,cmap='gray',scaling='log',clipvals='manual',min=0,max=12)
-    print("Total number of bragg disks is:{}".format(len(gx)))
-    num_peaks = len(gx)
-    row, col = datacube_symmetrize.data.shape[:2]
-    #obtain the cc intensity matrix
-    intensity_matrix = ObtainIntensityMatrix(datacube_symmetrize, braggpeaks_raw, probe_kernel_FT, Qx=gx, Qy=gy, max_dist=None)
-    braggpeaks_intensity = np.zeros((row, col, num_peaks))
-    for i in range(row):
-        for j in range(col):
-            R=i*col+j
-            braggpeaks_intensity[i,j,:] = intensity_matrix.X[:,R]
-    return braggpeaks_intensity
-
-def find_I0(braggpeaks_intensity):
-    storage2 = []
-    for i in range(braggpeaks_intensity.shape[0]):
-        for j in range(braggpeaks_intensity.shape[1]):
-            for k in range(braggpeaks_intensity.shape[2]):
-                if braggpeaks_intensity[i][j][k]>0:
-                    storage2.append(braggpeaks_intensity[i][j][k])
-    I_0 = np.percentile(storage2, 85)
-    
-    sns.set_style('darkgrid')
-    sns.displot(storage2, kind="ecdf")
-    plt.xlabel("cc intensity $I_{ij}$", fontsize=18)
-    plt.ylabel("Empirical Cumulative Probability", fontsize=18)
-    #sns.histplot(storage2)
-    
-    plt.rcParams['font.size'] = 18
-    plt.axhline(y=0.85, color='g', linestyle = '--', alpha=0.4, drawstyle='steps')
-    plt.axvline(x=I_0, ymin=0, ymax=0.85, color='r', linestyle = '--', alpha=0.4)
-    y = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 0.85, 1.0])
-    tick = ['0.0', '0.2', '0.4', '0.6', '0.8', '0.85', '1.0']
-    plt.yticks(y, tick)
-    plt.xlim(0, 40)
-    #plt.ylim(0, 1, 0.05)
-    plt.show()
-    plt.close()
-    return I_0
 
 def find_beta(datacube, braggpeaks_prob, particle_labels):
     data_par = particle_labels
@@ -592,10 +546,16 @@ def find_beta(datacube, braggpeaks_prob, particle_labels):
     beta = np.sqrt(4.92e-8/r)
     return beta
 
-def plot_transit_prob(gm, cov_ls, braggpeaks_prob, alpha, label, cluster1, cluster2, n):
-    mean_pos = gm.means_[:,:2]
-    mean1, mean2 = mean_pos[cluster1,:].astype(int), mean_pos[cluster2,:].astype(int)
-    print(mean1, mean2)
+def plot_transit_prob(gm, cov_ls, color_ls, pca, braggpeaks_intensity, regu_para,
+                      beta, label, cluster1, cluster2, n):
+    cluster1 -= 1
+    cluster2 -= 1
+
+    mean = gm.means_
+    cov_ls = cov_ls
+
+    mean1 = gm.means_[cluster1, :2]
+    mean2 = gm.means_[cluster2, :2]
 
     dist = np.sqrt((mean2[0]-mean1[0])**2+(mean2[1]-mean1[1])**2)
     dirc = np.array([mean2[0]-mean1[0], mean2[1]-mean1[1]])/dist
@@ -605,184 +565,44 @@ def plot_transit_prob(gm, cov_ls, braggpeaks_prob, alpha, label, cluster1, clust
     for i in range(pos.shape[0]):
         d = np.round(pos[i, 0])
         if not idx_ls or d != np.round(pos[idx_ls[-1], 0]):
-            idx_ls.append(i)               
-    X_plot = pos[idx_ls,].astype(int)
-    alpha=alpha
-    X_plot = np.hstack((X_plot, alpha*braggpeaks_prob[tuple(X_plot[:,0]), tuple(X_plot[:,1])]))
-    prob = gm.predict_proba(X_plot)
-    prob1, prob2 = prob[:,cluster1], prob[:,cluster2]
+            idx_ls.append(i)
+    coord_ls = pos[idx_ls,].astype(int)
+    features_loc = braggpeaks_intensity[tuple(coord_ls[:,0]), tuple(coord_ls[:,1])]
+    features_loc = pca.transform(features_loc)
+    X_plot = np.hstack((coord_ls, beta * features_loc))
 
-    n_points = X_plot.shape[0]
+    n_samples = X_plot.shape[0]
     n_components, n_features = gm.means_.shape[0], gm.means_.shape[1]
-    means = gm.means_
-    regu = 1e-5
-    
-    precisions_chol = np.empty((n_components, n_features))  
-    precisions = np.empty((n_components, n_features))
-    for k, covariance in enumerate(cov_ls):  
-        cov = np.diag(covariance) 
-        precisions_chol[k] = np.sqrt(1 / (cov + regu))
-        precisions[k] = 1 / (np.diag(covariance)+regu)
-    log_prob = np.empty((n_points, n_components))
-    log_det = np.sum(np.log(precisions_chol), axis=1)
-    for k, (mean, prec_chol) in enumerate(zip(means, precisions_chol)):
-        y = (X_plot-mean) * prec_chol
-        y = y**2
-        #print(np.max(y))
-        #y = np.minimum(y, -np.log(2 * np.pi / precisions[k])- 2*np.log(1))
-        #print(y.shape, (np.sum(y, axis=1)).shape)
-        #y[:, 2:] = np.minimum(y[:, 2:], -np.log(2 * np.pi / precisions[k][2:])- 2*np.log(50))
-        log_prob[:, k] = np.sum(y, axis=1)
+
+    #for full matrix
+    precisions_chol = np.empty((n_components, n_features, n_features))
+    for k, covariance in enumerate(cov_ls):
+        try:
+            cov_chol = linalg.cholesky(covariance + np.eye(n_features)*regu_para, lower=True)
+        except linalg.LinAlgError:
+            raise ValueError(estimate_precision_error_message)
+        precisions_chol[k] = linalg.solve_triangular(
+            cov_chol, np.eye(n_features), lower=True
+        ).T
+
+    log_det = np.sum(
+            np.log(precisions_chol.reshape(n_components, -1)[:, :: n_features + 1]), 1
+        )
+
+    log_prob = np.empty((n_samples, n_components))
+    for k, (mu, prec_chol) in enumerate(zip(mean, precisions_chol)):
+        y = np.dot(X_plot-mu, prec_chol)
+        log_prob[:, k] = np.sum(y**2, axis=1)
+
     prob_new = -0.5 * (n_features * np.log(2 * np.pi) + log_prob) + log_det[np.newaxis, :]
-    prob_new = 0.5 * prob_new
-    
     weighted_log_prob = prob_new + np.log(gm.weights_)
     log_prob_norm = np.log(np.sum(np.exp(weighted_log_prob), axis=1))
     log_resp = weighted_log_prob - log_prob_norm[:, np.newaxis]
     prob = np.exp(log_resp)
-    middle_idx = (np.array([1/6, 2/6, 3/6, 4/6, 5/6])*X_plot.shape[0]).astype(int)
-    middle_points = X_plot[list(middle_idx), :2]
-    middle_prob = prob[tuple(middle_idx), :]
-    
-    #draw the probability plot
-    c_ls = ['b', 'orange', 'g', 'r', 'm', 'brown']
-    #draw the whole line segment
-    for i in range(n_components):
-        plt.plot(np.arange(n_points)/n_points, prob[:,i], c=c_ls[i], label='segment '+str(i+1))
-    #scatter the reference points
-    for i in range(middle_points.shape[0]):
-        plt.scatter(middle_idx/n_points, np.max(middle_prob, axis=1), c='red')
-        #plt.plot(six/n_points, six_prob[:, i], s=10, c='red')
-    plt.xlabel('normalized distance to the center of segment %d'%(cluster2+1))
-    plt.ylabel('probability $\pi_k$')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('./figs/probplot')
-    plt.show()
-    plt.close()
-    
-    #draw the path in the segmentation plot
-    plt.imshow(label)
-    plt.plot(X_plot[:, 1], X_plot[:, 0], c='black')
-    plt.scatter(middle_points[:, 1], middle_points[:, 0], c='r')
-    plt.tight_layout()
-    plt.savefig('./figs/segplot')
-    plt.show()
-    plt.close()
-    
-    return X_plot, prob, middle_points, middle_prob
-        
-def plot_transit_prob_interpolate(gm, cov_ls, braggpeaks_prob, alpha, label, cluster1, cluster2, n, middle_points):
-    c_ls = ['b', 'orange', 'g', 'r', 'm', 'brown']
-    #cluster1, cluster2 = 5, 0
-    #n = 20
-    #middle_points = [[48,14],[66,13],[76,14],[83,18],[88,21]]
-    #middle_points = [[45,14],[43,19],[41,25],[40,28],[38,33]]
-    mean_pos = gm.means_[:, :2]
-    mean1, mean2 = mean_pos[cluster1,:], mean_pos[cluster2,:]
-    all_points = [mean1] + middle_points + [mean2] 
-    dist_all = 0
-    dist_ls = []
-    X_plot_all = None
-    prob_all = None
-    for i in range(len(all_points)-1):
-        dist = np.sqrt((all_points[i+1][0]-all_points[i][0])**2
-                       +(all_points[i+1][1]-all_points[i][1])**2)
-        temp_pos_ls = []
-        if not dist_ls:
-            dist_ls.append(dist)
-        else:
-            dist_ls.append(dist + dist_ls[-1])
-        dist_all += dist
-        dirc = np.array([all_points[i+1][0]-all_points[i][0], 
-                         all_points[i+1][1]-all_points[i][1]])/dist
-        pos = all_points[i] + np.array([i/n*dist*dirc for i in range(n)])
-        idx_ls = []
-        #only record points that are not duplicates
-        for i in range(pos.shape[0]):
-            if not idx_ls or list(pos[i].astype(int)) not in temp_pos_ls:
-                #print(list(pos[i].astype(int)), temp_pos_ls)
-                idx_ls.append(i)   
-                temp_pos_ls.append(list(pos[i].astype(int)))
-        X_plot = pos[idx_ls,].astype(int)
-        X_plot = np.hstack((X_plot, alpha*braggpeaks_prob[tuple(X_plot[:,0]), tuple(X_plot[:,1])]))
-        #prob = gm.predict_proba(X_plot)
-    
-        n_samples = X_plot.shape[0]
-        n_components, n_features = gm.means_.shape[0], gm.means_.shape[1]
-        #means = np.round(gm.means_[:, :2])
-        #means = means.astype(int)
-        #means = np.hstack((means, alpha * braggpeaks_prob[means[:, 0], means[:, 1]]))
-        means = gm.means_
-        regu = 1e-5
-        
-        precisions_chol = np.empty((n_components, n_features))  
-        precisions = np.empty((n_components, n_features))
-        for k, covariance in enumerate(cov_ls):  
-            cov = np.diag(covariance) 
-            #cov = covariance
-            precisions_chol[k] = np.sqrt(1 / (cov + regu))
-            precisions[k] = 1 / (cov + regu)
 
-        log_prob = np.empty((n_samples, n_components))
-        log_det = np.sum(np.log(precisions_chol), axis=1)
-        #log_prob = (
-        #        np.sum((means**2 * precisions), 1)
-        #        - 2.0 * np.dot(X_plot, (means * precisions).T)
-        #        + np.dot(X_plot**2, precisions.T)
-        #    )
-        #prob_new = -0.5 * (n_features * np.log(2 * np.pi) + log_prob) + log_det[np.newaxis, :]
-    
-        for k, (mean, prec_chol) in enumerate(zip(means, precisions_chol)):
-            y = (X_plot-mean) * prec_chol
-            y = y**2
-            #print(np.max(y))
-            #y[:, 2:] = np.minimum(y[:, 2:], -np.log(2 * np.pi / precisions[k][2:])- 2*np.log(2e2))
-            #y = np.minimum(y, -np.log(2 * np.pi / precisions[k]) - 2*np.log(1e1))
-            log_prob[:, k] = np.sum(y, axis=1)
-        prob_new = -0.5 * (n_features * np.log(2 * np.pi) + log_prob) + log_det[np.newaxis, :]
-        prob_new = 0.5 * prob_new
-        
-        weighted_log_prob = prob_new + np.log(gm.weights_)
-        log_prob_norm = np.log(np.sum(np.exp(weighted_log_prob), axis=1))
-        log_resp = weighted_log_prob - log_prob_norm[:, np.newaxis]
-        prob = np.exp(log_resp)
-        #prob = np.sqrt(np.exp(log_resp))
-        
-        #print(X_plot_all)
-        if X_plot_all is None:
-            X_plot_all = X_plot
-            prob_all = prob
-        else: #https://www.bilibili.com/video/BV1m34y187yn/
-            X_plot_all = np.vstack((X_plot_all, X_plot))
-            prob_all = np.vstack((prob_all, prob))
-    #calculate posterior of middle points
-    middle_norm = np.array(dist_ls[:-1]/dist_all)
-    middle_points = np.array(middle_points).astype(int)
-    middle_idx = []
-    for i in range(len(middle_points)):
-        middle_idx.append(np.argmin(np.linalg.norm(X_plot_all[:, :2] - np.array(middle_points[i]), axis=1)))
-    #middle_data = np.hstack((middle_points, alpha*braggpeaks_prob[tuple(middle_points[:, 0]), tuple(middle_points[:, 1])]))
-    #middle_prob = gm.predict_proba(middle_data)
-    middle_prob = prob_all[tuple(middle_idx), :]
-    n_points = X_plot_all.shape[0]
-    for i in range(n_components):
-        plt.plot(np.arange(n_points)/n_points, prob_all[:,i], c=c_ls[i], label='segment '+str(i+1))
-    plt.scatter(np.array(middle_idx)/n_points, np.max(middle_prob, axis=1), c='red')
-    plt.xlabel('normalized distance to the center of segment %d' % (cluster2+1))
-    plt.ylabel('probability $\pi_k$')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('./figs/probplot')
-    plt.show()
-    plt.close()
-    
-    #draw the path in the segmentation plot
-    plt.imshow(label)
-    plt.plot(X_plot_all[:, 1], X_plot_all[:, 0], c='black')
-    plt.scatter(middle_points[:, 1], middle_points[:, 0], c='r')
-    plt.tight_layout()
-    plt.savefig('./figs/segplot')
-    plt.show()
-    plt.close()
-    return X_plot_all, prob_all, middle_points, middle_prob  
+    middle_idx = (np.array([1/6, 2/6, 3/6, 4/6, 5/6])*n_samples).astype(int)
+    middle_prob = prob[tuple(middle_idx), :]
+    middle_points = coord_ls[list(middle_idx)].astype(int)
+
+    return coord_ls, X_plot, prob, middle_idx, middle_points, middle_prob
+
