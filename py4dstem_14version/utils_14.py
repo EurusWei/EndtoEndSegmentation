@@ -23,7 +23,6 @@ from numbers import Number
 from math import log
 from copy import copy
 import time
-import seaborn as sns
 from sklearn.decomposition import PCA
 
 # ref: https://levelup.gitconnected.com/a-simple-method-to-calculate-circular-intensity-averages-in-images-4186a685af3
@@ -105,7 +104,7 @@ def average_datacube(datacube, n):
         for j in range(n, datacube.R_Ny - n):
             avg[i - n, j - n, :,
                 :] = np.mean(datacube.data[i - n:i + n, j - n:j + n, :, :], axis=(0, 1))
-    datacube_average.crop_data_real(n, datacube.R_Nx - n, n, datacube.R_Ny - n)
+    datacube_average.crop_R((n, datacube.R_Nx - n, n, datacube.R_Ny - n))
     # store the average information into an array
     datacube_info = np.zeros(
         (datacube_average.data.shape[0], datacube_average.data.shape[0], datacube.Q_Nx, datacube.Q_Ny))
@@ -214,8 +213,8 @@ def symmetrize_datacube(datacube_average, probe_kernel_FT, origin_x, origin_y):
     # first recenter each DP at [origin_x, origin_y]
     for n in py4DSTEM.process.utils.tqdmnd(range(datacube_average.R_N)):
         Rx, Ry = np.unravel_index(n, datacube_average.data.shape[:2])
-        intensity = py4DSTEM.process.utils.get_cross_correlation_fk(
-            datacube_average.data[Rx, Ry], probe_kernel_FT, corrPower=1, returnval='cc')
+        intensity = py4DSTEM.process.utils.get_cross_correlation_FT(
+            datacube_average.data[Rx, Ry], probe_kernel_FT, corrPower=1)
         orig_intensity = intensity[origin_x, origin_y]
         curr_orig_x, curr_orig_y = origin_x, origin_y
         for w_x in range(origin_x - 4, origin_x + 4):
@@ -456,7 +455,7 @@ def subtract_bg(datacube_symmetrize, particle_index, par_param, center, alpha_bg
     return datacube_symmetrize
 
 
-def get_bragg_vector_map_raw(braggpeaks, Q_Nx, Q_Ny):
+def get_bragg_vector_map_raw(braggpeaks, Q_Nx, Q_Ny, R_Nx, R_Ny):
     """
     Calculates the Bragg vector map from a PointListArray of Bragg peak positions, where
     the peak positions have not been centered.
@@ -467,15 +466,17 @@ def get_bragg_vector_map_raw(braggpeaks, Q_Nx, Q_Ny):
     Returns:
         (2D ndarray, shape (Q_Nx,Q_Ny)): the bragg vector map
     """
-    assert np.all([name in braggpeaks.dtype.names for name in ['qx', 'qy', 'intensity']]
-                  ), "braggpeaks coords must include coordinates: 'qx', 'qy', 'intensity'."
-
-    # Concatenate all PointList data together for speeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeed
-    bigpl = np.concatenate(
-        [pl.data for subpl in braggpeaks.pointlists for pl in subpl])
-    qx = bigpl['qx']
-    qy = bigpl['qy']
-    I = bigpl['intensity']
+    qx = []
+    qy = []
+    I = []
+    for Rx in range(R_Nx):
+        for Ry in range(R_Ny):
+            qx.extend(braggpeaks.raw[Rx, Ry]._data['qx'])
+            qy.extend(braggpeaks.raw[Rx, Ry]._data['qy'])
+            I.extend(braggpeaks.raw[Rx, Ry]._data['intensity'])
+    qx = np.array(qx)
+    qy = np.array(qy)
+    I = np.array(I)
 
     # Precompute rounded coordinates
     floorx = np.floor(qx).astype(np.int64)
@@ -533,14 +534,13 @@ def ObtainIntensityMatrix(datacube, braggpeaks, probe_kernel_FT, Qx, Qy, max_dis
     for Rx in range(R_Nx):
         for Ry in range(R_Ny):
             s = braggpeak_labels[Rx][Ry]
-            #pointlist = braggpeaks.raw[Rx, Ry]
-            pointlist = braggpeaks.get_pointlist(Rx, Ry)
+            pointlist = braggpeaks.raw[Rx, Ry]
             for i in s:
-                ind = np.argmin(np.hypot(pointlist.data['qx'] - Qx[i],
-                                         pointlist.data['qy'] - Qy[i]))
-                X[Rx, Ry, i] = pointlist.data['intensity'][ind]
-            cc_intensity = py4DSTEM.process.utils.get_cross_correlation_fk(
-                datacube.data[Rx, Ry], probe_kernel_FT, corrPower=1, returnval='cc')
+                ind = np.argmin(np.hypot(pointlist._data['qx'] - Qx[i],
+                                         pointlist._data['qy'] - Qy[i]))
+                X[Rx, Ry, i] = pointlist._data['intensity'][ind]
+            cc_intensity = py4DSTEM.process.utils.get_cross_correlation_FT(
+                datacube.data[Rx, Ry], probe_kernel_FT, corrPower=1)
             not_s = [i for i in range(N_feat) if i not in s]
             for i in not_s:
                 X[Rx, Ry, i] = max(cc_intensity[round(Qx[i]), round(Qy[i])], 0)
@@ -548,19 +548,17 @@ def ObtainIntensityMatrix(datacube, braggpeaks, probe_kernel_FT, Qx, Qy, max_dis
 
 
 def get_braggpeak_labels_by_scan_position(braggpeaks, R_Nx, R_Ny, Qx, Qy, max_dist=None):
-    assert np.all([name in braggpeaks.dtype.names for name in (
-        'qx', 'qy')]), "braggpeaks must contain coords 'qx' and 'qy'"
     braggpeak_labels = [[set() for i in range(braggpeaks.shape[1])]
                         for j in range(braggpeaks.shape[0])]
     for Rx in range(R_Nx):
         for Ry in range(R_Ny):
             s = braggpeak_labels[Rx][Ry]
-            pointlist = braggpeaks.get_pointlist(Rx, Ry)
+            pointlist = braggpeaks.raw[Rx, Ry]
             for i in range(pointlist.data.shape[0]):
                 label = np.argmin(
-                    np.hypot(Qx - pointlist.data['qx'][i], Qy - pointlist.data['qy'][i]))
+                    np.hypot(Qx - pointlist._data['qx'][i], Qy - pointlist._data['qy'][i]))
                 if max_dist is not None:
-                    if np.hypot(Qx[label] - pointlist.data['qx'][i], Qy[label] - pointlist.data['qy'][i]) < max_dist:
+                    if np.hypot(Qx[label] - pointlist._data['qx'][i], Qy[label] - pointlist._data['qy'][i]) < max_dist:
                         s.add(label)
                 else:
                     s.add(label)
