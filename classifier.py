@@ -107,8 +107,7 @@ class BraggVectorClassification(object):
         return
 
     def nmf(self, max_iterations=1):
-        sklearn_nmf = NMF(n_components=self.N_c,
-                          init="custom", max_iter=max_iterations)
+        sklearn_nmf = NMF(n_components=self.N_c, init="custom", max_iter=max_iterations)
         self.W_next = sklearn_nmf.fit_transform(self.X, W=self.W, H=self.H)
         self.H_next = sklearn_nmf.components_
         self.N_c_next = self.W_next.shape[1]
